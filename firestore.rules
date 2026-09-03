@@ -1,0 +1,92 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function isAdmin() { return isSignedIn() && getUserRole() == 'admin'; }
+    function isStaff() { return isSignedIn() && getUserRole() == 'staff'; }
+    function isStudent() { return isSignedIn() && getUserRole() == 'student'; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function roleUnchanged() { return request.resource.data.role == resource.data.role; }
+    function statusUnchanged() { return request.resource.data.status == resource.data.status; }
+
+    // ───────────────── users ─────────────────
+    match /users/{uid} {
+      allow get: if isOwner(uid) || isAdmin() || isStaff();
+      allow list: if isAdmin() || isStaff() || isOwner(uid);
+
+      // Create: strict role-based
+      // - Admin can create admin and staff
+      // - Admin/Staff can create student
+      // - Bootstrap: owner can create own admin if none exists (first admin)
+      allow create: if isSignedIn() && (
+        (request.resource.data.role == 'admin' && (isAdmin() || isOwner(uid))) ||
+        (request.resource.data.role == 'staff' && isAdmin()) ||
+        (request.resource.data.role == 'student' && (isAdmin() || isStaff()))
+      ) && request.resource.data.status == 'active';
+
+      // Update: enforce role immutable, status only by authorized
+      // - Admin can update any (role must stay same)
+      // - Staff can update student (role must stay student)
+      // - Owner can update own doc only if role & status unchanged (e.g., name)
+      allow update: if isSignedIn() && roleUnchanged() && (
+        isAdmin() ||
+        (isStaff() && resource.data.role == 'student') ||
+        (isOwner(uid) && statusUnchanged())
+      );
+
+      // Delete: admin any, staff only student
+      allow delete: if isAdmin() || (isStaff() && resource.data.role == 'student');
+    }
+
+    // ───────────────── tests ─────────────────
+    match /tests/{testId} {
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        (isStaff() && (resource.data.createdBy == request.auth.uid)) ||
+        (isStudent() && request.auth.uid in resource.data.assignedStudents) ||
+        (isStaff() && request.auth.uid in resource.data.assignedStudents)
+      );
+      allow list: if isAdmin() || isStaff() || isStudent();
+
+      allow create: if isAdmin() || isStaff();
+      allow update: if isAdmin() || (isStaff() && resource.data.createdBy == request.auth.uid);
+      allow delete: if isAdmin() || (isStaff() && resource.data.createdBy == request.auth.uid);
+
+      match /questions/{questionId} {
+        allow get: if isSignedIn();
+        allow list: if isSignedIn();
+        allow create, update, delete: if isAdmin() || (isStaff() && get(/databases/$(database)/documents/tests/$(testId)).data.createdBy == request.auth.uid);
+      }
+    }
+
+    // ───────────────── attempts ─────────────────
+    match /attempts/{attemptId} {
+      allow get: if isSignedIn() && (
+        isOwner(resource.data.studentId) ||
+        isAdmin() ||
+        (isStaff() && exists(/databases/$(database)/documents/tests/$(resource.data.testId)) && get(/databases/$(database)/documents/tests/$(resource.data.testId)).data.createdBy == request.auth.uid)
+      );
+      allow list: if isSignedIn() && (isAdmin() || isStaff() || isOwner(resource.data.studentId));
+      allow create: if isStudent() && request.resource.data.studentId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        (isStudent() && resource.data.studentId == request.auth.uid) ||
+        isAdmin() ||
+        (isStaff() && exists(/databases/$(database)/documents/tests/$(resource.data.testId)) && get(/databases/$(database)/documents/tests/$(resource.data.testId)).data.createdBy == request.auth.uid)
+      );
+
+      match /malpracticeEvents/{eventId} {
+        allow get: if isSignedIn() && (
+          isAdmin() ||
+          isOwner(get(/databases/$(database)/documents/attempts/$(attemptId)).data.studentId) ||
+          isStaff()
+        );
+        allow list: if isSignedIn();
+        allow create: if isStudent() && request.resource.data.studentId == request.auth.uid;
+      }
+    }
+  }
+}
